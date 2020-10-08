@@ -1,64 +1,107 @@
-const assert = require('assert')
-const EventEmitter = require('events')
-const createMetamaskProvider = require('web3-provider-engine/zero.js')
-const SubproviderFromProvider = require('web3-provider-engine/subproviders/provider.js')
-const createInfuraProvider = require('eth-json-rpc-infura/src/createProvider')
-const ObservableStore = require('obs-store')
-const ComposedStore = require('obs-store/lib/composed')
-const extend = require('xtend')
-const EthQuery = require('eth-query')
-const createEventEmitterProxy = require('../../lib/events-proxy.js')
-const log = require('loglevel')
-const urlUtil = require('url')
-const {
-  ROPSTEN,
+import assert from 'assert'
+import EventEmitter from 'events'
+import ObservableStore from 'obs-store'
+import ComposedStore from 'obs-store/lib/composed'
+import JsonRpcEngine from 'json-rpc-engine'
+import providerFromEngine from 'eth-json-rpc-middleware/providerFromEngine'
+import log from 'loglevel'
+import { createSwappableProxy, createEventEmitterProxy } from 'swappable-obj-proxy'
+import EthQuery from 'eth-query'
+import createMetamaskMiddleware from './createMetamaskMiddleware'
+import createInfuraClient from './createInfuraClient'
+import createJsonRpcClient from './createJsonRpcClient'
+import createLocalhostClient from './createLocalhostClient'
+
+import {
   RINKEBY,
-  KOVAN,
   MAINNET,
   LOCALHOST,
-} = require('./enums')
-const LOCALHOST_RPC_URL = 'http://localhost:8545'
-const INFURA_PROVIDER_TYPES = [ROPSTEN, RINKEBY, KOVAN, MAINNET]
+  INFURA_PROVIDER_TYPES,
+  NETWORK_TYPE_TO_ID_MAP,
+} from './enums'
 
 const env = process.env.METAMASK_ENV
-const METAMASK_DEBUG = process.env.METAMASK_DEBUG
-const testMode = (METAMASK_DEBUG || env === 'test')
 
-const defaultProviderConfig = {
-  type: testMode ? RINKEBY : MAINNET,
+let defaultProviderConfigType
+let defaultProviderChainId
+if (process.env.IN_TEST === 'true') {
+  defaultProviderConfigType = LOCALHOST
+  // Decimal 5777, an arbitrary chain ID we use for testing
+  defaultProviderChainId = '0x1691'
+} else if (process.env.METAMASK_DEBUG || env === 'test') {
+  defaultProviderConfigType = RINKEBY
+} else {
+  defaultProviderConfigType = MAINNET
 }
 
-module.exports = class NetworkController extends EventEmitter {
+const defaultProviderConfig = {
+  type: defaultProviderConfigType,
+  ticker: 'ETH',
+}
+if (defaultProviderChainId) {
+  defaultProviderConfig.chainId = defaultProviderChainId
+}
+
+export default class NetworkController extends EventEmitter {
 
   constructor (opts = {}) {
     super()
 
-    // parse options
-    const providerConfig = opts.provider || defaultProviderConfig
     // create stores
-    this.providerStore = new ObservableStore(providerConfig)
+    this.providerStore = new ObservableStore(
+      opts.provider || { ...defaultProviderConfig },
+    )
     this.networkStore = new ObservableStore('loading')
-    this.store = new ComposedStore({ provider: this.providerStore, network: this.networkStore })
-    // create event emitter proxy
-    this._proxy = createEventEmitterProxy()
+    this.store = new ComposedStore({
+      provider: this.providerStore,
+      network: this.networkStore,
+    })
+
+    // provider and block tracker
+    this._provider = null
+    this._blockTracker = null
+
+    // provider and block tracker proxies - because the network changes
+    this._providerProxy = null
+    this._blockTrackerProxy = null
 
     this.on('networkDidChange', this.lookupNetwork)
   }
 
-  initializeProvider (_providerParams) {
-    this._baseProviderParams = _providerParams
-    const { type, rpcTarget } = this.providerStore.getState()
-    this._configureProvider({ type, rpcTarget })
-    this._proxy.on('block', this._logBlock.bind(this))
-    this._proxy.on('error', this.verifyNetwork.bind(this))
-    this.ethQuery = new EthQuery(this._proxy)
+  /**
+   * Sets the Infura project ID
+   *
+   * @param {string} projectId - The Infura project ID
+   * @throws {Error} if the project ID is not a valid string
+   * @return {void}
+   */
+  setInfuraProjectId (projectId) {
+    if (!projectId || typeof projectId !== 'string') {
+      throw new Error('Invalid Infura project ID')
+    }
+
+    this._infuraProjectId = projectId
+  }
+
+  initializeProvider (providerParams) {
+    this._baseProviderParams = providerParams
+    const { type, rpcUrl, chainId } = this.getProviderConfig()
+    this._configureProvider({ type, rpcUrl, chainId })
     this.lookupNetwork()
-    return this._proxy
+  }
+
+  // return the proxies so the references will always be good
+  getProviderAndBlockTracker () {
+    const provider = this._providerProxy
+    const blockTracker = this._blockTrackerProxy
+    return { provider, blockTracker }
   }
 
   verifyNetwork () {
     // Check network when restoring connectivity:
-    if (this.isNetworkLoading()) this.lookupNetwork()
+    if (this.isNetworkLoading()) {
+      this.lookupNetwork()
+    }
   }
 
   getNetworkState () {
@@ -66,7 +109,7 @@ module.exports = class NetworkController extends EventEmitter {
   }
 
   setNetworkState (network) {
-    return this.networkStore.putState(network)
+    this.networkStore.putState(network)
   }
 
   isNetworkLoading () {
@@ -75,38 +118,72 @@ module.exports = class NetworkController extends EventEmitter {
 
   lookupNetwork () {
     // Prevent firing when provider is not defined.
-    if (!this.ethQuery || !this.ethQuery.sendAsync) {
-      return log.warn('NetworkController - lookupNetwork aborted due to missing ethQuery')
+    if (!this._provider) {
+      log.warn('NetworkController - lookupNetwork aborted due to missing provider')
+      return
     }
-    this.ethQuery.sendAsync({ method: 'net_version' }, (err, network) => {
-      if (err) return this.setNetworkState('loading')
-      log.info('web3.getNetwork returned ' + network)
-      this.setNetworkState(network)
+
+    const { type } = this.getProviderConfig()
+    const chainId = this.getCurrentChainId()
+    if (!chainId) {
+      log.warn('NetworkController - lookupNetwork aborted due to missing chainId')
+      this.setNetworkState('loading')
+      return
+    }
+
+    // Ping the RPC endpoint so we can confirm that it works
+    const ethQuery = new EthQuery(this._provider)
+    const initialNetwork = this.getNetworkState()
+    ethQuery.sendAsync({ method: 'net_version' }, (err, networkVersion) => {
+      const currentNetwork = this.getNetworkState()
+      if (initialNetwork === currentNetwork) {
+        if (err) {
+          this.setNetworkState('loading')
+          return
+        }
+
+        this.setNetworkState((
+          type === 'rpc'
+            ? chainId
+            : networkVersion
+        ))
+      }
     })
   }
 
-  setRpcTarget (rpcTarget) {
-    const providerConfig = {
-      type: 'rpc',
-      rpcTarget,
-    }
-    this.providerConfig = providerConfig
+  getCurrentChainId () {
+    const { type, chainId: configChainId } = this.getProviderConfig()
+    return NETWORK_TYPE_TO_ID_MAP[type]?.chainId || configChainId
   }
 
-  async setProviderType (type) {
+  setRpcTarget (rpcUrl, chainId, ticker = 'ETH', nickname = '', rpcPrefs) {
+    this.setProviderConfig({
+      type: 'rpc',
+      rpcUrl,
+      chainId,
+      ticker,
+      nickname,
+      rpcPrefs,
+    })
+  }
+
+  async setProviderType (type, rpcUrl = '', ticker = 'ETH', nickname = '') {
     assert.notEqual(type, 'rpc', `NetworkController - cannot call "setProviderType" with type 'rpc'. use "setRpcTarget"`)
     assert(INFURA_PROVIDER_TYPES.includes(type) || type === LOCALHOST, `NetworkController - Unknown rpc type "${type}"`)
-    const providerConfig = { type }
-    this.providerConfig = providerConfig
+    const { chainId } = NETWORK_TYPE_TO_ID_MAP[type]
+    this.setProviderConfig({ type, rpcUrl, chainId, ticker, nickname })
   }
 
   resetConnection () {
-    this.providerConfig = this.getProviderConfig()
+    this.setProviderConfig(this.getProviderConfig())
   }
 
-  set providerConfig (providerConfig) {
-    this.providerStore.updateState(providerConfig)
-    this._switchNetwork(providerConfig)
+  /**
+   * Sets the provider config and switches the network.
+   */
+  setProviderConfig (config) {
+    this.providerStore.updateState(config)
+    this._switchNetwork(config)
   }
 
   getProviderConfig () {
@@ -120,74 +197,69 @@ module.exports = class NetworkController extends EventEmitter {
   _switchNetwork (opts) {
     this.setNetworkState('loading')
     this._configureProvider(opts)
-    this.emit('networkDidChange')
+    this.emit('networkDidChange', opts.type)
   }
 
-  _configureProvider (opts) {
-    const { type, rpcTarget } = opts
+  _configureProvider ({ type, rpcUrl, chainId }) {
     // infura type-based endpoints
     const isInfura = INFURA_PROVIDER_TYPES.includes(type)
     if (isInfura) {
-      this._configureInfuraProvider(opts)
+      this._configureInfuraProvider(type, this._infuraProjectId)
     // other type-based rpc endpoints
     } else if (type === LOCALHOST) {
-      this._configureStandardProvider({ rpcUrl: LOCALHOST_RPC_URL })
+      this._configureLocalhostProvider()
     // url-based rpc endpoints
     } else if (type === 'rpc') {
-      this._configureStandardProvider({ rpcUrl: rpcTarget })
+      this._configureStandardProvider(rpcUrl, chainId)
     } else {
       throw new Error(`NetworkController - _configureProvider - unknown type "${type}"`)
     }
   }
 
-  _configureInfuraProvider ({ type }) {
-    log.info('_configureInfuraProvider', type)
-    const infuraProvider = createInfuraProvider({ network: type })
-    const infuraSubprovider = new SubproviderFromProvider(infuraProvider)
-    const providerParams = extend(this._baseProviderParams, {
-      engineParams: {
-        pollingInterval: 8000,
-        blockTrackerProvider: infuraProvider,
-      },
-      dataSubprovider: infuraSubprovider,
+  _configureInfuraProvider (type, projectId) {
+    log.info('NetworkController - configureInfuraProvider', type)
+    const networkClient = createInfuraClient({
+      network: type,
+      projectId,
     })
-    const provider = createMetamaskProvider(providerParams)
-    this._setProvider(provider)
+    this._setNetworkClient(networkClient)
   }
 
-  _configureStandardProvider ({ rpcUrl }) {
-    // urlUtil handles malformed urls
-    rpcUrl = urlUtil.parse(rpcUrl).format()
-    const providerParams = extend(this._baseProviderParams, {
-      rpcUrl,
-      engineParams: {
-        pollingInterval: 8000,
-      },
-    })
-    const provider = createMetamaskProvider(providerParams)
-    this._setProvider(provider)
+  _configureLocalhostProvider () {
+    log.info('NetworkController - configureLocalhostProvider')
+    const networkClient = createLocalhostClient()
+    this._setNetworkClient(networkClient)
   }
 
-  _setProvider (provider) {
-    // collect old block tracker events
-    const oldProvider = this._provider
-    let blockTrackerHandlers
-    if (oldProvider) {
-      // capture old block handlers
-      blockTrackerHandlers = oldProvider._blockTracker.proxyEventHandlers
-      // tear down
-      oldProvider.removeAllListeners()
-      oldProvider.stop()
+  _configureStandardProvider (rpcUrl, chainId) {
+    log.info('NetworkController - configureStandardProvider', rpcUrl)
+    const networkClient = createJsonRpcClient({ rpcUrl, chainId })
+    this._setNetworkClient(networkClient)
+  }
+
+  _setNetworkClient ({ networkMiddleware, blockTracker }) {
+    const metamaskMiddleware = createMetamaskMiddleware(this._baseProviderParams)
+    const engine = new JsonRpcEngine()
+    engine.push(metamaskMiddleware)
+    engine.push(networkMiddleware)
+    const provider = providerFromEngine(engine)
+    this._setProviderAndBlockTracker({ provider, blockTracker })
+  }
+
+  _setProviderAndBlockTracker ({ provider, blockTracker }) {
+    // update or intialize proxies
+    if (this._providerProxy) {
+      this._providerProxy.setTarget(provider)
+    } else {
+      this._providerProxy = createSwappableProxy(provider)
     }
-    // override block tracler
-    provider._blockTracker = createEventEmitterProxy(provider._blockTracker, blockTrackerHandlers)
-    // set as new provider
+    if (this._blockTrackerProxy) {
+      this._blockTrackerProxy.setTarget(blockTracker)
+    } else {
+      this._blockTrackerProxy = createEventEmitterProxy(blockTracker, { eventFilter: 'skipInternal' })
+    }
+    // set new provider and blockTracker
     this._provider = provider
-    this._proxy.setTarget(provider)
-  }
-
-  _logBlock (block) {
-    log.info(`BLOCK CHANGED: #${block.number.toString('hex')} 0x${block.hash.toString('hex')}`)
-    this.verifyNetwork()
+    this._blockTracker = blockTracker
   }
 }

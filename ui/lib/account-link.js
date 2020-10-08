@@ -1,26 +1,24 @@
-module.exports = function (address, network) {
-  const net = parseInt(network)
-  let link
-  switch (net) {
-    case 1: // main net
-      link = `https://etherscan.io/address/${address}`
-      break
-    case 2: // morden test net
-      link = `https://morden.etherscan.io/address/${address}`
-      break
-    case 3: // ropsten test net
-      link = `https://ropsten.etherscan.io/address/${address}`
-      break
-    case 4: // rinkeby test net
-      link = `https://rinkeby.etherscan.io/address/${address}`
-      break
-    case 42: // kovan test net
-      link = `https://kovan.etherscan.io/address/${address}`
-      break
-    default:
-      link = ''
-      break
+export default function getAccountLink (address, network, rpcPrefs) {
+  if (rpcPrefs && rpcPrefs.blockExplorerUrl) {
+    return `${rpcPrefs.blockExplorerUrl.replace(/\/+$/u, '')}/address/${address}`
   }
 
-  return link
+  // eslint-disable-next-line radix
+  const net = parseInt(network)
+  switch (net) {
+    case 1: // main net
+      return `https://etherscan.io/address/${address}`
+    case 2: // morden test net
+      return `https://morden.etherscan.io/address/${address}`
+    case 3: // ropsten test net
+      return `https://ropsten.etherscan.io/address/${address}`
+    case 4: // rinkeby test net
+      return `https://rinkeby.etherscan.io/address/${address}`
+    case 42: // kovan test net
+      return `https://kovan.etherscan.io/address/${address}`
+    case 5: // goerli test net
+      return `https://goerli.etherscan.io/address/${address}`
+    default:
+      return ''
+  }
 }
